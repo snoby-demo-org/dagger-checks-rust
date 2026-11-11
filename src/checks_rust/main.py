@@ -139,6 +139,12 @@ def _parse_rust_build(text: str) -> dict:
             stack.append((key, indent))
             container.setdefault(key, {})
             continue
+        if val == "{}":
+            # flow-style empty map: `variants: {daemon: {}}` — a variant with NO
+            # overrides must still exist as a key, or the overlay lookup treats
+            # a declared variant as unknown.
+            container[key] = {}
+            continue
         container[key] = _strip_outer_quotes(val)
     return cfg
 
