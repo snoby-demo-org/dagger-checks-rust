@@ -122,6 +122,46 @@ def _bool(val, default: bool) -> bool:
     return str(val).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _parse_checks_build_scan(text: str) -> dict:
+    """Extract checks.build.scan.{enabled,fail_on,ignore_unfixed,sbom_repo}.
+
+    Mirrors the dagger-checks-c convention so a repo can declare the image-scan
+    gate in the same place for both language modules; the rust-build block's
+    own scan: wins when both are present.
+    """
+    scan: dict = {}
+    in_checks = in_build = in_scan = False
+    checks_indent = build_indent = scan_indent = 0
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = _indent(raw)
+        line = raw.strip()
+        if not in_checks:
+            if line == "checks:":
+                in_checks, checks_indent = True, indent
+            continue
+        if indent <= checks_indent and not line.startswith("-"):
+            break
+        if not in_build:
+            if line == "build:":
+                in_build, build_indent = True, indent
+            continue
+        if indent <= build_indent and not line.startswith("-"):
+            in_build = False
+            continue
+        if not in_scan:
+            if line == "scan:":
+                in_scan, scan_indent = True, indent
+            continue
+        if indent <= scan_indent:
+            in_scan = False
+            continue
+        key, _, val = line.partition(":")
+        scan[key.strip()] = _strip_outer_quotes(val.split(" #")[0])
+    return scan
+
+
 async def _commit_sha(source: dagger.Directory) -> str:
     """Commit sha for tagging. Dagger excludes .git from directory sync, so CI
     checkouts can't `git rev-parse`; the machinery's .truenorth_commit is read
@@ -172,6 +212,13 @@ class ChecksRust:
         artifact_path = cfg.get("artifact_path") or f"{DEFAULT_BUILD_DIR}/target/release/{binary}"
         publish_repo = str(cfg.get("publish") or "").rstrip("/")
         scan_cfg = cfg.get("scan") or {}
+        if not scan_cfg:
+            # fall back to the machinery's shared convention (checks.build.scan)
+            try:
+                scan_cfg = _parse_checks_build_scan(
+                    await source.file(".github/truenorth.yaml").contents())
+            except Exception:  # noqa: BLE001
+                scan_cfg = {}
 
         sha = await _commit_sha(source)
         bargs = [
