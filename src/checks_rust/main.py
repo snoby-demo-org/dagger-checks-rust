@@ -338,21 +338,38 @@ class ChecksRust:
                              + (f"; failing: {failing}" if failing else "; none at fail-on severity"))
                 if sbom_repo:
                     addr = f"{sbom_repo}:sha-{sha or 'unknown'}"
-                    await (
-                        dag.container().from_("alpine:3.20")
-                        .with_file("/sbom.json", sbom_f)
-                        .publish(addr)
-                    )
-                    payload["sbom"] = addr
-                    lines.append(f"  sbom: {addr}")
+                    # Best-effort: the SBOM is an artifact of convenience, not
+                    # part of the gate. A registry the engine cannot reach
+                    # (internal CA not in the engine's trust store) must not
+                    # fail an otherwise-clean build.
+                    try:
+                        await (
+                            dag.container().from_("alpine:3.20")
+                            .with_file("/sbom.json", sbom_f)
+                            .publish(addr)
+                        )
+                        payload["sbom"] = addr
+                        lines.append(f"  sbom: {addr}")
+                    except Exception as e:  # noqa: BLE001
+                        lines.append(f"  sbom publish SKIPPED (non-fatal): {str(e)[:160]}")
+                        payload["sbom"] = None
                 payload["scan"] = {"status": "fail" if failing else "pass",
                                    "counts": counts, "total": len(matches)}
                 if failing:
+                    top = sorted(matches, key=lambda m: -len(json.dumps(m)))[:10]
+                    summary = "\n".join(
+                        f"    {((m.get('vulnerability') or {}).get('id') or '?')} "
+                        f"[{((m.get('vulnerability') or {}).get('severity') or '?')}] "
+                        f"{((m.get('artifact') or {}).get('name') or '?')} "
+                        f"{((m.get('artifact') or {}).get('version') or '')} -> "
+                        f"{((m.get('vulnerability') or {}).get('fix', {}) or {}).get('versions') or 'no fix'}"
+                        for m in top)
                     raise RuntimeError(
                         f"build FAILED at stage=image-scan: vulnerabilities at fail-on "
                         f"severity ({', '.join(f'{k}={v}' for k, v in failing.items())})\n"
                         f"  no staging tag was pushed; bump the base image or adjust "
-                        f"rust-build.scan in truenorth.yaml")
+                        f"rust-build.scan / checks.build.scan in truenorth.yaml\n"
+                        f"  top findings:\n{summary}")
             except RuntimeError:
                 raise
             except Exception as e:  # noqa: BLE001 — scan infrastructure failure is a hard fail
