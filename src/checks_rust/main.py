@@ -18,8 +18,8 @@ BUILD PATH (dockerfile-driven, mirrors dagger-checks-c PATH A):
        image, so probes can exec).
     2. ARTIFACT GATE — ELF magic at `rust-build.artifact_path` inside that
        stage. No binary -> status=fail at stage=artifact-gate, hard fail.
-    3. version probe (`<bin> --version`) — reported, never fatal (a
-       dynamically-linked binary in a slim builder may miss libs).
+    3. artifact/version probes — reported, never fatal (a dynamically-linked
+       binary in a slim builder may miss libs).
     4. IMAGE SCAN (optional) — syft SBOM + grype CVE gate on the FINAL image,
        BEFORE any staging tag is pushed (fail means no tag -> the Kargo
        warehouse never sees the artifact).
@@ -37,12 +37,27 @@ the harness and read only here):
       dockerfile: Dockerfile
       target: builder
       artifact_path: /tmp/xelis-build/target/release/xelis_daemon
-      publish: zot.viporlab.net/demo/xelis-staging
+      publish: registry.viporlab.net/demo/xelis-daemon-staging
       scan:
         enabled: true
         fail_on: high,critical
         ignore_unfixed: true
         sbom_repo: registry.viporlab.net/demo/xelis-sbom
+
+Multiple images from ONE commit (v0.2.0) — the harness passes `--variant <id>`
+from checks.build.matrix, and each id overlays `rust-build.variants.<id>`:
+
+      variants:
+        daemon: {}                    # default block above, empty overlay
+        wallet:
+          app: xelis_wallet
+          dockerfile: docker/Dockerfile.wallet
+          publish: registry.viporlab.net/demo/xelis-wallet-staging
+
+An UNKNOWN variant is a hard error (silently falling back to the default image
+would publish the wrong binary under the right name). Prefer one publish repo
+per image so the tag stays a plain sha-<commit>; a shared repo needs
+`tag_suffix: true` or the images overwrite each other.
 
 Absent block: defaults app=xelis_daemon, binary=<app>, dockerfile=Dockerfile,
 target=builder, artifact_path=/tmp/xelis-build/target/release/<binary>,
@@ -77,16 +92,24 @@ def _strip_outer_quotes(val: str) -> str:
 
 
 def _parse_rust_build(text: str) -> dict:
-    """Extract the top-level `rust-build:` block (flat keys + one nested `scan:`).
+    """Extract the top-level `rust-build:` block, including nested sections.
 
     Line-based on purpose: the module runs in the SDK image, which ships no
-    PyYAML. Nested `scan:` is a single level, matching the block shape above.
+    PyYAML. Nesting is tracked with an indent stack, so `scan:` AND
+    `variants:` (a map of variant-id -> overrides) both parse:
+
+        rust-build:
+          app: xelis_daemon
+          scan: { ... }             # or block form
+          variants:
+            wallet:
+              app: xelis_wallet
+              dockerfile: docker/Dockerfile.wallet
     """
     cfg: dict = {"scan": {}}
     in_block = False
     block_indent = 0
-    section = None
-    section_indent = 0
+    stack: list = []  # [(section_name, indent), ...] — outermost first
     for raw in text.splitlines():
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
@@ -99,20 +122,24 @@ def _parse_rust_build(text: str) -> dict:
             continue
         if indent <= block_indent and not line.startswith("-"):
             break  # left the block
+        # pop sections we have dedented out of
+        while stack and indent <= stack[-1][1]:
+            stack.pop()
         key, _, val = line.partition(":")
         key = key.strip()
         val = val.split(" #")[0].strip() if val else ""
+        container = cfg
+        for name, _ in stack:
+            nxt = container.get(name)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                container[name] = nxt
+            container = nxt
         if not val:
-            section = key
-            section_indent = indent
-            if key == "scan":
-                cfg.setdefault("scan", {})
+            stack.append((key, indent))
+            container.setdefault(key, {})
             continue
-        if section == "scan" and indent > section_indent:
-            cfg["scan"][key] = _strip_outer_quotes(val)
-            continue
-        section = None
-        cfg[key] = _strip_outer_quotes(val)
+        container[key] = _strip_outer_quotes(val)
     return cfg
 
 
@@ -196,14 +223,37 @@ class ChecksRust:
         fail-on severities, or when the staging publish fails. Warnings are
         reported, never fatal.
 
-        `variant` is accepted for workflow-matrix compatibility (the harness
-        passes --variant=<id> only when truenorth.yaml declares a build
-        matrix); it is recorded in the payload and the staging tag.
+        `variant` selects a per-image override from the top-level
+        `rust-build.variants.<id>` block (app/binary/dockerfile/target/
+        artifact_path/publish), so one repo can publish several images
+        (daemon, wallet, …) from a single commit. An unknown variant is a HARD
+        error — silently falling back to the default image would publish the
+        wrong binary under the right name. The variant is recorded in the
+        payload; the staging tag carries a `-<variant>` suffix only when the
+        images share one publish repo (`tag_suffix: true`).
         """
         try:
             cfg = _parse_rust_build(await source.file(".github/truenorth.yaml").contents())
         except Exception:  # noqa: BLE001 — no/unreadable control block -> defaults
             cfg = {"scan": {}}
+
+        variants = cfg.get("variants") or {}
+        if isinstance(variants, dict) and variants:
+            if variant:
+                vcfg = variants.get(variant)
+                if not isinstance(vcfg, dict):
+                    raise RuntimeError(
+                        f"build FAILED: unknown build variant '{variant}' "
+                        f"(declared: {sorted(variants)})")
+                # overlay: explicit per-variant keys win, everything else inherits
+                merged = dict(cfg)
+                merged.pop("variants", None)
+                merged.update(vcfg)
+                cfg = merged
+            elif len(variants) > 1:
+                raise RuntimeError(
+                    "build FAILED: rust-build.variants declares "
+                    f"{sorted(variants)} but the harness passed no --variant")
 
         app = cfg.get("app") or DEFAULT_APP
         binary = cfg.get("binary") or app
@@ -377,7 +427,11 @@ class ChecksRust:
 
         # ---- 6. staging publish by digest (promotion-not-rebuild)
         if publish_repo and img is not None:
-            tag = "sha-" + (sha or "unknown") + (f"-{variant}" if variant else "")
+            # One publish repo per image (recommended) keeps the tag a plain
+            # sha-<commit>; a shared repo needs `tag_suffix: true` so the two
+            # images cannot overwrite each other.
+            suffix = f"-{variant}" if (variant and _bool(cfg.get("tag_suffix"), False)) else ""
+            tag = "sha-" + (sha or "unknown") + suffix
             addr = f"{publish_repo}:{tag}"
             lines.append(f"  staging: publishing gated image -> {addr}")
             digest = await img.publish(addr)
