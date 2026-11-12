@@ -1,6 +1,6 @@
 {
   "name": "checks-rust",
-  "engineVersion": "v0.21.9",
+  "engineVersion": "v1.0.0-beta.25",
   "sdk": {
     "source": "python"
   }
